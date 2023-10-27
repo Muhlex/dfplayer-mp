@@ -34,14 +34,23 @@ _START_BIT = const(0x7e)
 _END_BIT   = const(0xef)
 _VERSION   = const(0xff)
 
+_EVENT_INSERT      = const(0x3a)
+_EVENT_EJECT       = const(0x3b)
 _EVENT_DONE_USB    = const(0x3c)
 _EVENT_DONE_SDCARD = const(0x3d)
 _EVENT_DONE_FLASH  = const(0x3e)
+_EVENT_DONE        = _EVENT_DONE_USB # used as a generic alias where the device is abstracted away
+_EVENT_READY       = const(0x3f)
+
+_DEVICE_USB            = const(0x01)
+_DEVICE_SDCARD         = const(0x02)
+_DEVICE_USB_AND_SDCARD = const(0x03)
+_DEVICE_FLASH          = const(0x08)
 
 _EVENT_TO_DEVICE = {
-	_EVENT_DONE_USB:    const(0x01),
-	_EVENT_DONE_SDCARD: const(0x02),
-	_EVENT_DONE_FLASH:  const(0x08),
+	_EVENT_DONE_USB:    _DEVICE_USB,
+	_EVENT_DONE_SDCARD: _DEVICE_SDCARD,
+	_EVENT_DONE_FLASH:  _DEVICE_FLASH,
 }
 
 _LOG_NONE  = const(0)
@@ -49,8 +58,8 @@ _LOG_DEBUG = const(1)
 _LOG_ALL   = const(2)
 
 class DFPlayer:
-	FOLDER_ROOT = const(-1)
-	FOLDER_MP3 = const(-2)
+	FOLDER_ROOT   = const(-1)
+	FOLDER_MP3    = const(-2)
 	FOLDER_ADVERT = const(-3)
 
 	STATE_STOPPED = const(0)
@@ -64,15 +73,10 @@ class DFPlayer:
 	EQ_CLASSIC = const(4)
 	EQ_BASS    = const(5)
 
-	EVENT_INSERT = const(0x3a)
-	EVENT_EJECT  = const(0x3b)
-	EVENT_DONE   = const(0x3c)
-	EVENT_READY  = const(0x3f)
-
-	DEVICE_USB            = const(0x01)
-	DEVICE_SDCARD         = const(0x02)
-	DEVICE_USB_AND_SDCARD = const(0x03)
-	DEVICE_FLASH          = const(0x08)
+	DEVICE_USB            = _DEVICE_USB
+	DEVICE_SDCARD         = _DEVICE_SDCARD
+	DEVICE_USB_AND_SDCARD = _DEVICE_USB_AND_SDCARD
+	DEVICE_FLASH          = _DEVICE_FLASH
 
 	LOG_NONE  = _LOG_NONE
 	LOG_DEBUG = _LOG_DEBUG
@@ -112,10 +116,10 @@ class DFPlayer:
 		class Events():
 			def __init__(self):
 				self.handlers = {
-					DFPlayer.EVENT_INSERT: [],
-					DFPlayer.EVENT_EJECT: [],
-					DFPlayer.EVENT_DONE: [],
-					DFPlayer.EVENT_READY: [],
+					_EVENT_INSERT: [],
+					_EVENT_EJECT: [],
+					_EVENT_DONE: [],
+					_EVENT_READY: [],
 				}
 				self.track_done = Event()
 				self.track_done.set()
@@ -195,20 +199,22 @@ class DFPlayer:
 
 		if event == _EVENT_DONE_USB or event == _EVENT_DONE_SDCARD or event == _EVENT_DONE_FLASH:
 			device = _EVENT_TO_DEVICE[event]
-			track_id = self._bytes_to_uint16((bytes[5], bytes[6])) # TODO: pass to handler
-			event = DFPlayer.EVENT_DONE
+			track_id = self._bytes_to_uint16((bytes[5], bytes[6]))
+			args = (device, track_id)
+			event = _EVENT_DONE
 			if self._events.advert_done.is_set():
 				self._events.track_done.set()
 			else:
 				self._events.advert_done.set()
-		elif event == DFPlayer.EVENT_INSERT or event == DFPlayer.EVENT_EJECT or event == DFPlayer.EVENT_READY:
+		elif event == _EVENT_INSERT or event == _EVENT_EJECT or event == _EVENT_READY:
 			device = bytes[6]
+			args = (device, )
 		else:
 			self._log("Received unknown event:", hex(event));
 			return
 
 		for handler in self._events.handlers[event]:
-			handler(device)
+			handler(*args)
 
 	def _require_lock(func):
 		async def locked(self: DFPlayer, *args, **kwargs):
@@ -342,14 +348,35 @@ class DFPlayer:
 	async def reset(self):
 		await self.send_cmd(0x0c, timeout=self.timeout + 200)
 
-	async def wait_track(self):
+	async def wait_track_done(self):
 		await self._events.track_done.wait()
 
-	async def wait_advert(self):
+	async def wait_advert_done(self):
 		await self._events.advert_done.wait()
 
-	def on(self, event: int, handler: Callable[[int]]):
+	def on_done(self, handler: Callable[[int, int]]):
+		self._on(_EVENT_DONE, handler)
+	def on_eject(self, handler: Callable[[int]]):
+		self._on(_EVENT_EJECT, handler)
+	def on_insert(self, handler: Callable[[int]]):
+		self._on(_EVENT_INSERT, handler)
+	def on_ready(self, handler: Callable[[int]]):
+		self._on(_EVENT_READY, handler)
+
+	def _on(self, event: int, handler: Callable):
 		self._events.handlers[event].append(handler)
 
-	def off(self, event: int, handler: Callable[[int]]):
-		self._events.handlers[event].remove(handler)
+	def off_done(self, handler: Callable[[int, int]] | None = None):
+		self._off(_EVENT_DONE, handler)
+	def off_eject(self, handler: Callable[[int]] | None = None):
+		self._off(_EVENT_EJECT, handler)
+	def off_insert(self, handler: Callable[[int]] | None = None):
+		self._off(_EVENT_INSERT, handler)
+	def off_ready(self, handler: Callable[[int]] | None = None):
+		self._off(_EVENT_READY, handler)
+
+	def _off(self, event: int, handler: Callable | None):
+		if handler is None:
+			self._events.handlers[event].clear()
+		else:
+			self._events.handlers[event].remove(handler)
