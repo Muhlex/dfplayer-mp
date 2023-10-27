@@ -1,2 +1,2 @@
 from .dfplayer import DFPlayer
-from .dfplayer import DFPlayerError, DFPlayerUnavailableError, DFPlayerResponseError, DFPlayerUnexpectedResponseError
+from .dfplayer import DFPlayerError, DFPlayerTimeoutError, DFPlayerTransmissionError, DFPlayerInternalError, DFPlayerUnexpectedMessageError

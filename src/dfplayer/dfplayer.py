@@ -21,16 +21,18 @@ except ImportError:
 
 class DFPlayerError(Exception):
 	pass
-class DFPlayerUnavailableError(DFPlayerError):
+class DFPlayerTimeoutError(DFPlayerError):
 	pass
-class DFPlayerResponseError(DFPlayerError):
+class DFPlayerTransmissionError(DFPlayerError):
 	pass
-class DFPlayerUnexpectedResponseError(DFPlayerError):
+class DFPlayerInternalError(DFPlayerError):
+	pass
+class DFPlayerUnexpectedMessageError(DFPlayerError):
 	pass
 
-_START_BIT = const(0x7E)
-_END_BIT   = const(0xEF)
-_VERSION   = const(0xFF)
+_START_BIT = const(0x7e)
+_END_BIT   = const(0xef)
+_VERSION   = const(0xff)
 
 _EVENT_DONE_USB    = const(0x3c)
 _EVENT_DONE_SDCARD = const(0x3d)
@@ -68,11 +70,7 @@ class DFPlayer:
 	DEVICE_USB_AND_SDCARD = const(0x03)
 	DEVICE_FLASH          = const(0x08)
 
-	def __init__(self, uart_id: int, tx = None, rx = None, timeout = 100, retries = 7, debug = False):
-		kwargs = {};
-		if tx is not None: kwargs["tx"] = tx
-		if rx is not None: kwargs["rx"] = rx
-
+	def __init__(self, uart_id: int, timeout = 100, retries = 5, debug = False, **kwargs):
 		self._uart = UART(uart_id)
 		self._uart.init(
 			baudrate=9600, bits=8, parity=None, stop=1, timeout=0,
@@ -96,7 +94,11 @@ class DFPlayer:
 			_END_BIT,
 		])
 		self._buffer_read = bytearray(10)
-		self._read_idle_task = create_task(self._read_idle())
+		self._error: DFPlayerError | None = None
+		self._read_task = create_task(self._read_loop()) # TODO: Clean this up? (As well as stream/UART in general)
+		self._message_receive_ready = Event()
+		self._message_receive_done = Event()
+		self._message_receive_done.set()
 
 		class Events():
 			def __init__(self):
@@ -117,25 +119,99 @@ class DFPlayer:
 	def _log(self, *args, **kwargs):
 		print("[DF]", *args, **kwargs)
 
-	async def _read_idle(self):
+	def _get_checksum(self, bytes: bytearray):
+		result = 0
+		for i in range(1, 7):
+			result += bytes[i]
+		return -result
+
+	def _uint16_to_bytes(self, value: int):
+		return (value >> 8 & 0xFF), (value & 0xFF)
+
+	def _bytes_to_uint16(self, bytes: tuple[int, int]):
+		return (bytes[0] << 8) + bytes[1];
+
+	async def _read(self):
+		bytes = self._buffer_read
+		read_count = await self._stream.readinto(bytes)
+		if self.debug:
+			self._log("Read", read_count, "bytes: ", [hex(byte) for byte in bytes][:read_count])
+		if read_count != 10:
+			raise DFPlayerTransmissionError("Malformed message: Incomplete frame");
+		if bytes[0] != _START_BIT or bytes[1] != _VERSION or bytes[9] != _END_BIT:
+			raise DFPlayerTransmissionError("Malformed message: Invalid format");
+		if (bytes[7], bytes[8]) != self._uint16_to_bytes(self._get_checksum(bytes)):
+			raise DFPlayerTransmissionError("Malformed message: Invalid checksum");
+		if bytes[3] == 0x40: # error reply
+			err_code = bytes[6]
+			err_code_readable = "(" + hex(err_code) + ")"
+			if err_code == 0x00:
+				raise DFPlayerInternalError("Module is busy " + err_code_readable)
+			elif err_code == 0x01:
+				raise DFPlayerInternalError("Received incomplete frame " + err_code_readable)
+			elif err_code == 0x02:
+				raise DFPlayerInternalError("Received corrupt frame " + err_code_readable)
+			else:
+				raise DFPlayerInternalError("Unknown error " + err_code_readable)
+
+	async def _read_loop(self):
 		while True:
 			try:
-				await self._read(timeout=None)
-				if self.debug:
-					self._log("Unexpected data received:", [hex(byte) for byte in self._buffer_read])
+				await self._read();
+				if (0xf0 & self._buffer_read[3]) == 0x30: # event notifications
+					self._handle_event()
+					continue;
+				self._error = None
 			except DFPlayerError as error:
-				if self.debug:
-					self._log("Unexpected error received:", error)
+				self._error = error
+
+			if not self._message_receive_done.is_set():
+				self._message_receive_ready.set()
+				await self._message_receive_done.wait()
+
+	async def _receive_message(self, timeout: int):
+		try:
+			self._message_receive_done.clear()
+			await wait_for_ms(self._message_receive_ready.wait(), timeout)
+			if self._error:
+				raise self._error
+		except TimeoutError:
+			raise DFPlayerTimeoutError("DFPlayer did not answer in time")
+		finally:
+			self._message_receive_ready.clear()
+			self._message_receive_done.set()
+
+	def _handle_event(self):
+		bytes = self._buffer_read
+		event = bytes[3]
+		if self.debug:
+			self._log("--> EVENT:", hex(event))
+
+		if event == _EVENT_DONE_USB or event == _EVENT_DONE_SDCARD or event == _EVENT_DONE_FLASH:
+			device = _EVENT_TO_DEVICE[event]
+			track_id = self._bytes_to_uint16((bytes[5], bytes[6])) # TODO: pass to handler
+			event = DFPlayer.EVENT_DONE
+			if self._events.advert_done.is_set():
+				self._events.track_done.set()
+			else:
+				self._events.advert_done.set()
+		elif event == DFPlayer.EVENT_INSERT or event == DFPlayer.EVENT_EJECT or event == DFPlayer.EVENT_READY:
+			device = bytes[6]
+		else:
+			if self.debug:
+				self._log("Received unknown event:", hex(event));
+			return
+
+		for handler in self._events.handlers[event]:
+			handler(device)
 
 	def _require_lock(func):
 		async def locked(self: DFPlayer, *args, **kwargs):
 			try:
 				await self._lock.acquire()
-				self._read_idle_task.cancel()
 				return await func(self, *args, **kwargs)
 			finally:
 				self._lock.release()
-				self._read_idle_task = create_task(self._read_idle())
 		return locked
 
 	@_require_lock
@@ -157,27 +233,24 @@ class DFPlayer:
 			if self.debug:
 				self._log("<-- Send CMD", hex(cmd))
 
-			while self._uart.any():
-				count = await self._stream.readinto(self._buffer_read)
-				if self.debug:
-					self._log("Discarded", count, "bytes from RX")
-				await sleep_ms(0)
 			self._stream.write(bytes)
+			while self._uart.any():
+				await sleep_ms(0)
 			await self._stream.drain()
 
 			try:
-				await self._read(timeout) # wait for the ACK response
+				await self._receive_message(timeout);
 			except DFPlayerError as error:
 				if retries == 0:
 					raise error
 				if self.debug and retries > 0:
-					self._log("ERROR:", error)
+					self._log("ERROR ({}: {})".format(type(error).__name__, str(error)))
 					self._log("Retrying command...")
 				continue
 
-			command = self._buffer_read[3]
-			if command != 0x41: # ACK
-				raise DFPlayerUnexpectedResponseError("ACK expected, instead received: " + hex(command))
+			res_cmd = self._buffer_read[3]
+			if res_cmd != 0x41: # ACK
+				raise DFPlayerUnexpectedMessageError("ACK expected, instead received: " + hex(res_cmd))
 			if self.debug:
 				self._log("--> ACKd CMD", hex(cmd))
 			break
@@ -185,70 +258,12 @@ class DFPlayer:
 	@_require_lock
 	async def send_query(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
 		await self._send_cmd(cmd, param1, param2, timeout)
-		await self._read(timeout=self.timeout)
+		await self._receive_message(self.timeout);
 		bytes = self._buffer_read
-		command = bytes[3]
-		if command != cmd:
-			raise DFPlayerUnexpectedResponseError("Query for " + hex(cmd) + " returned command " + hex(command))
-		return bytes
-
-	async def _read(self, timeout: int | None = None):
-		bytes = self._buffer_read
-		if timeout is None:
-			read_count = await self._stream.readinto(bytes)
-		else:
-			try:
-				read_count = await wait_for_ms(self._stream.readinto(bytes), timeout)
-			except TimeoutError:
-				raise DFPlayerUnavailableError("Response timed out")
-		if read_count != 10 or bytes[0] != _START_BIT or bytes[1] != _VERSION or bytes[9] != _END_BIT:
-			raise DFPlayerUnavailableError("Malformed response");
-		if (bytes[7], bytes[8]) != self._uint16_to_bytes(self._get_checksum(bytes)):
-			raise DFPlayerUnavailableError("Malformed response: Invalid checksum");
-		if bytes[3] == 0x40: # error response
-			err_code = bytes[6]
-			err_code_readable = "(" + hex(err_code) + ")"
-			if err_code == 0x00:
-				raise DFPlayerResponseError("Module is busy " + err_code_readable)
-			elif err_code == 0x01:
-				raise DFPlayerResponseError("Received incomplete frame " + err_code_readable)
-			elif err_code == 0x02:
-				raise DFPlayerResponseError("Received corrupt frame " + err_code_readable)
-			else:
-				raise DFPlayerResponseError("Unknown error " + err_code_readable)
-		if (0xF0 & bytes[3]) == 0x30: # event notification
-			self._handle_event(bytes[3], bytes[6])
-			await self._read(timeout)
-
-	def _handle_event(self, event: int, param: int):
-		if self.debug:
-			self._log("--> EVENT:", hex(event))
-
-		if event == _EVENT_DONE_USB or event == _EVENT_DONE_SDCARD or event == _EVENT_DONE_FLASH:
-			device = _EVENT_TO_DEVICE[event]
-			event = DFPlayer.EVENT_DONE
-			if self._events.advert_done.is_set():
-				self._events.track_done.set()
-			else:
-				self._events.advert_done.set()
-		elif event == DFPlayer.EVENT_INSERT or event == DFPlayer.EVENT_EJECT or event == DFPlayer.EVENT_READY:
-			device = param
-		else:
-			if self.debug:
-				self._log("Received unknown event:", hex(event));
-			return
-
-		for func in self._events.handlers[event]:
-			func(device)
-
-	def _get_checksum(self, bytes: bytearray):
-		result = 0
-		for i in range(1, 7):
-			result += bytes[i]
-		return -result
-
-	def _uint16_to_bytes(self, value: int):
-		return (value >> 8 & 0xFF), (value & 0xFF)
+		res_cmd = bytes[3]
+		if res_cmd != cmd:
+			raise DFPlayerUnexpectedMessageError("Query for " + hex(cmd) + " returned command " + hex(res_cmd))
+		return self._bytes_to_uint16((bytes[5], bytes[6]))
 
 	async def play(self, folder: int, file: int):
 		if folder == DFPlayer.FOLDER_ADVERT:
@@ -268,7 +283,7 @@ class DFPlayer:
 		elif folder == DFPlayer.FOLDER_MP3:
 			await self.send_cmd(0x12, file)
 		else: # numbered folder
-			await self.send_cmd(0x0F, folder, file)
+			await self.send_cmd(0x0f, folder, file)
 
 	async def play_advert(self, file: int):
 		await self.play(DFPlayer.FOLDER_ADVERT, file)
@@ -278,7 +293,7 @@ class DFPlayer:
 		await self.send_cmd(0x0D, timeout=self.timeout + 100)
 
 	async def pause(self):
-		await self.send_cmd(0x0E)
+		await self.send_cmd(0x0e)
 
 	async def stop(self):
 		await self.send_cmd(0x16)
@@ -293,38 +308,35 @@ class DFPlayer:
 		await self.send_cmd(0x02)
 
 	async def state(self):
-		bytes = await self.send_query(0x42)
-		return bytes[6]
+		return await self.send_query(0x42)
 
 	async def playing(self):
 		# TODO: Add busy pin support
 		return (await self.state()) == DFPlayer.STATE_PLAYING
 
-	async def volume(self, volume: int | None = None) -> int:
+	async def volume(self, volume: int | None = None):
 		if volume is None:
-			bytes = await self.send_query(0x43)
-			return bytes[6]
+			return await self.send_query(0x43)
 		else:
 			await self.send_cmd(0x06, volume)
 			return volume
 
-	async def eq(self, eq: int | None = None) -> int:
+	async def eq(self, eq: int | None = None):
 		if eq is None:
-			bytes = await self.send_query(0x44)
-			return bytes[6]
+			return await self.send_query(0x44)
 		else:
 			await self.send_cmd(0x07, eq)
 			return eq
 
 	async def sleep(self):
-		# TODO: Make this work
-		await self.send_cmd(0x0A)
+		# TODO: Document that this often doesn't work
+		await self.send_cmd(0x0a)
 
 	async def wake(self):
-		await self.send_cmd(0x0B)
+		await self.send_cmd(0x0b)
 
 	async def reset(self):
-		await self.send_cmd(0x0C, timeout=self.timeout + 200)
+		await self.send_cmd(0x0c, timeout=self.timeout + 200)
 
 	async def wait_track(self):
 		await self._events.track_done.wait()
