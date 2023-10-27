@@ -44,6 +44,10 @@ _EVENT_TO_DEVICE = {
 	_EVENT_DONE_FLASH:  const(0x08),
 }
 
+_LOG_NONE  = const(0)
+_LOG_DEBUG = const(1)
+_LOG_ALL   = const(2)
+
 class DFPlayer:
 	FOLDER_ROOT = const(-1)
 	FOLDER_MP3 = const(-2)
@@ -70,7 +74,11 @@ class DFPlayer:
 	DEVICE_USB_AND_SDCARD = const(0x03)
 	DEVICE_FLASH          = const(0x08)
 
-	def __init__(self, uart_id: int, timeout = 100, retries = 5, debug = False, **kwargs):
+	LOG_NONE  = _LOG_NONE
+	LOG_DEBUG = _LOG_DEBUG
+	LOG_ALL   = _LOG_ALL
+
+	def __init__(self, uart_id: int, timeout = 100, retries = 5, log_level = _LOG_NONE, **kwargs):
 		self._uart = UART(uart_id)
 		self._uart.init(
 			baudrate=9600, bits=8, parity=None, stop=1, timeout=0,
@@ -80,6 +88,7 @@ class DFPlayer:
 		self._lock = Lock()
 		self.timeout = timeout
 		self.retries = retries
+		self.log_level = log_level
 
 		self._buffer_send = bytearray([
 			_START_BIT,
@@ -114,10 +123,9 @@ class DFPlayer:
 				self.advert_done.set()
 		self._events = Events()
 
-		self.debug = debug
-
-	def _log(self, *args, **kwargs):
-		print("[DF]", *args, **kwargs)
+	def _log(self, *args, level = _LOG_DEBUG, **kwargs):
+		if self.log_level >= level:
+			print("[DF]", *args, **kwargs)
 
 	def _get_checksum(self, bytes: bytearray):
 		result = 0
@@ -134,8 +142,7 @@ class DFPlayer:
 	async def _read(self):
 		bytes = self._buffer_read
 		read_count = await self._stream.readinto(bytes)
-		if self.debug:
-			self._log("Read", read_count, "bytes: ", [hex(byte) for byte in bytes][:read_count])
+		self._log("Read", read_count, "bytes: ", [hex(byte) for byte in bytes][:read_count], level=_LOG_ALL)
 		if read_count != 10:
 			raise DFPlayerTransmissionError("Malformed message: Incomplete frame");
 		if bytes[0] != _START_BIT or bytes[1] != _VERSION or bytes[9] != _END_BIT:
@@ -184,8 +191,7 @@ class DFPlayer:
 	def _handle_event(self):
 		bytes = self._buffer_read
 		event = bytes[3]
-		if self.debug:
-			self._log("--> EVENT:", hex(event))
+		self._log("--> EVENT:", hex(event))
 
 		if event == _EVENT_DONE_USB or event == _EVENT_DONE_SDCARD or event == _EVENT_DONE_FLASH:
 			device = _EVENT_TO_DEVICE[event]
@@ -198,8 +204,7 @@ class DFPlayer:
 		elif event == DFPlayer.EVENT_INSERT or event == DFPlayer.EVENT_EJECT or event == DFPlayer.EVENT_READY:
 			device = bytes[6]
 		else:
-			if self.debug:
-				self._log("Received unknown event:", hex(event));
+			self._log("Received unknown event:", hex(event));
 			return
 
 		for handler in self._events.handlers[event]:
@@ -217,6 +222,7 @@ class DFPlayer:
 	@_require_lock
 	def send_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
 		return self._send_cmd(cmd, param1, param2, timeout)
+
 	async def _send_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
 		if param2 is None:
 			param1, param2 = self._uint16_to_bytes(param1)
@@ -230,8 +236,7 @@ class DFPlayer:
 		bytes[7], bytes[8] = self._uint16_to_bytes(self._get_checksum(bytes))
 
 		for retries in reversed(range(self.retries + 1)):
-			if self.debug:
-				self._log("<-- Send CMD", hex(cmd))
+			self._log("<-- Send CMD", hex(cmd))
 
 			self._stream.write(bytes)
 			while self._uart.any():
@@ -243,7 +248,7 @@ class DFPlayer:
 			except DFPlayerError as error:
 				if retries == 0:
 					raise error
-				if self.debug and retries > 0:
+				if retries > 0:
 					self._log("ERROR ({}: {})".format(type(error).__name__, str(error)))
 					self._log("Retrying command...")
 				continue
@@ -251,8 +256,7 @@ class DFPlayer:
 			res_cmd = self._buffer_read[3]
 			if res_cmd != 0x41: # ACK
 				raise DFPlayerUnexpectedMessageError("ACK expected, instead received: " + hex(res_cmd))
-			if self.debug:
-				self._log("--> ACKd CMD", hex(cmd))
+			self._log("--> ACKd CMD", hex(cmd))
 			break
 
 	@_require_lock
