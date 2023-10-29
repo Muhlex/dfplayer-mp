@@ -8,19 +8,21 @@ from machine import UART
 from binascii import hexlify
 
 try:
-	from asyncio import create_task, sleep_ms, TimeoutError
+	from asyncio import create_task, sleep_ms, Task, TimeoutError
 	from asyncio.funcs import wait_for_ms
 	from asyncio.stream import Stream
 	from asyncio.lock import Lock
 	from asyncio.event import Event
 except ImportError:
-	from uasyncio import create_task, sleep_ms, TimeoutError
+	from uasyncio import create_task, sleep_ms, Task, TimeoutError
 	from uasyncio.funcs import wait_for_ms
 	from uasyncio.stream import Stream
 	from uasyncio.lock import Lock
 	from uasyncio.event import Event
 
 class DFPlayerError(Exception):
+	pass
+class DFPlayerInitializationError(DFPlayerError):
 	pass
 class DFPlayerTimeoutError(DFPlayerError):
 	pass
@@ -34,6 +36,10 @@ class DFPlayerInternalError(DFPlayerError):
 		return "{} ({})".format(self.value, hex(self.code))
 class DFPlayerUnexpectedMessageError(DFPlayerError):
 	pass
+
+_INIT_FALSE   = const(0)
+_INIT_TRUE    = const(1)
+_INIT_DEINIT  = const(2)
 
 _START_BIT = const(0x7e)
 _END_BIT   = const(0xef)
@@ -118,15 +124,12 @@ class DFPlayer:
 		retries = 5,
 		skip_ack: set[int] = {},
 		log_level = _LOG_NONE,
-		**kwargs
 	):
+		self._init = _INIT_FALSE
 		self._uart = UART(uart_id)
-		self._uart.init(
-			baudrate=9600, bits=8, parity=None, stop=1, timeout=0,
-			**kwargs
-		)
 		self._stream = Stream(self._uart)
 		self._lock = Lock()
+		self._read_task: Task | None = None
 
 		self.timeout = timeout
 		self.feedback_timeout = feedback_timeout
@@ -152,7 +155,6 @@ class DFPlayer:
 		self._message_receive_ready = Event()
 		self._message_receive_done = Event()
 		self._message_receive_done.set()
-		self._read_task = create_task(self._read_loop()) # TODO: Clean this up? (As well as stream/UART in general)
 
 		self._last_selected_device = DFPlayer.DEVICE_SDCARD
 
@@ -180,6 +182,21 @@ class DFPlayer:
 			def format_error(self, error: BaseException):
 				return "{}: {}".format(type(error).__name__, str(error))
 		self._log = Log(uart_id)
+
+	def init(self, **kwargs):
+		if self._init == _INIT_DEINIT:
+			raise DFPlayerInitializationError("Cannot initialize DFPlayer instance after deinit")
+		self._uart.init(baudrate=9600, bits=8, parity=None, stop=1, **kwargs)
+		self._read_task = create_task(self._read_loop())
+		self._init = _INIT_TRUE
+
+	def deinit(self):
+		if self._init != _INIT_TRUE:
+			raise DFPlayerInitializationError("Cannot deinit uninitialized DFPlayer instance")
+		self._stream.close()
+		self._uart.deinit()
+		self._read_task.cancel()
+		self._init = _INIT_DEINIT
 
 	def _get_checksum(self, bytes: bytearray):
 		result = 0
@@ -281,6 +298,8 @@ class DFPlayer:
 			handler(*args)
 
 	async def _exec_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
+		if self._init != _INIT_TRUE:
+			raise DFPlayerInitializationError("DFPlayer instance must be initialized to execute commands")
 		if param2 is None:
 			param1, param2 = self._uint16_to_bytes(param1)
 		if timeout is None:
