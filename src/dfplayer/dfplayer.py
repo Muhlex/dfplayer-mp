@@ -112,7 +112,14 @@ class DFPlayer:
 	LOG_DEBUG = _LOG_DEBUG
 	LOG_ALL   = _LOG_ALL
 
-	def __init__(self, uart_id: int, timeout = 200, feedback_timeout = 50, retries = 5, log_level = _LOG_NONE, **kwargs):
+	def __init__(
+		self, uart_id: int,
+		timeout = 200, feedback_timeout = 50,
+		retries = 5,
+		skip_ack: set[int] = {},
+		log_level = _LOG_NONE,
+		**kwargs
+	):
 		self._uart = UART(uart_id)
 		self._uart.init(
 			baudrate=9600, bits=8, parity=None, stop=1, timeout=0,
@@ -124,6 +131,7 @@ class DFPlayer:
 		self.timeout = timeout
 		self.feedback_timeout = feedback_timeout
 		self.retries = retries
+		self.skip_ack = skip_ack
 		self.log_level = log_level
 
 		self._buffer_send = bytearray([
@@ -131,7 +139,7 @@ class DFPlayer:
 			_VERSION,
 			_LENGTH, # number of bytes w/o start, end, checksum
 			0, # command
-			1, # whether to use ACK
+			0, # whether to use ACK
 			0, # param1
 			0, # param2
 			0, # checksum
@@ -169,6 +177,8 @@ class DFPlayer:
 				return self.log_level >= min_level
 			def print(self, *args, **kwargs):
 				print("[DF {}]".format(self._id), *args, **kwargs)
+			def format_error(self, error: BaseException):
+				return "{}: {}".format(type(error).__name__, str(error))
 		self._log = Log(uart_id)
 
 	def _get_checksum(self, bytes: bytearray):
@@ -181,7 +191,7 @@ class DFPlayer:
 		return (value >> 8 & 0xFF), (value & 0xFF)
 
 	def _bytes_to_uint16(self, bytes: tuple[int, int]):
-		return (bytes[0] << 8) + bytes[1];
+		return (bytes[0] << 8) + bytes[1]
 
 	def _validate_read(self, stop: int):
 		bytes = self._buffer_read
@@ -189,9 +199,9 @@ class DFPlayer:
 		or (stop > 1 and bytes[1] != _VERSION)
 		or (stop > 2 and bytes[2] != _LENGTH)
 		or (stop > 9 and bytes[9] != _END_BIT)):
-			raise DFPlayerTransmissionError("Corrupt frame received");
+			raise DFPlayerTransmissionError("Corrupt frame received")
 		if stop > 8 and (bytes[7], bytes[8]) != self._uint16_to_bytes(self._get_checksum(bytes)):
-			raise DFPlayerTransmissionError("Invalid checksum");
+			raise DFPlayerTransmissionError("Invalid checksum")
 
 	async def _read(self):
 		bytes = self._buffer_read
@@ -216,10 +226,10 @@ class DFPlayer:
 	async def _read_loop(self):
 		while True:
 			try:
-				await self._read();
+				await self._read()
 				if (0xf0 & self._buffer_read[3]) == 0x30: # event notifications
 					self._handle_event()
-					continue;
+					continue
 				self._error = None
 			except DFPlayerError as error:
 				self._error = error
@@ -228,7 +238,10 @@ class DFPlayer:
 				self._message_receive_ready.set()
 				await self._message_receive_done.wait()
 			elif self._log(_LOG_ALL):
-				self._log.print("Ignoring RX message...")
+				self._log.print(
+					"Ignoring RX message...",
+					"({})".format(self._log.format_error(self._error) if self._error else hex(self._buffer_read[3]))
+				)
 
 	async def _receive_message(self, timeout: int):
 		try:
@@ -272,9 +285,11 @@ class DFPlayer:
 			param1, param2 = self._uint16_to_bytes(param1)
 		if timeout is None:
 			timeout = self.timeout
+		use_ack = cmd not in self.skip_ack
 
 		bytes = self._buffer_send
 		bytes[3] = cmd
+		bytes[4] = use_ack
 		bytes[5] = param1
 		bytes[6] = param2
 		bytes[7], bytes[8] = self._uint16_to_bytes(self._get_checksum(bytes))
@@ -288,14 +303,16 @@ class DFPlayer:
 				await sleep_ms(0)
 			await self._stream.drain()
 
+			if not use_ack:
+				break
 			# Wait for ACK:
 			try:
-				await self._receive_message(timeout);
+				await self._receive_message(timeout)
 			except DFPlayerError as error:
 				if retries == 0:
 					raise error
 				if retries > 0 and self._log():
-					self._log.print("ERROR ({}: {})".format(type(error).__name__, str(error)))
+					self._log.print("ERROR ({})".format(self._log.format_error(error)))
 					self._log.print("Retrying command...")
 				continue
 
@@ -317,9 +334,9 @@ class DFPlayer:
 	@_require_lock
 	async def send_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
 		await self._exec_cmd(cmd, param1, param2, timeout)
-		# Wait for feedback (success / internal error):
+		# Wait for feedback (success / internal error), timeout type depends on whether cmd was ACKd:
 		try:
-			await self._receive_message(self.feedback_timeout);
+			await self._receive_message(self.feedback_timeout if self._buffer_send[4] else self.timeout)
 		except DFPlayerInternalError as error:
 			raise error
 		except (DFPlayerTimeoutError, DFPlayerTransmissionError):
@@ -330,8 +347,8 @@ class DFPlayer:
 	@_require_lock
 	async def send_query(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
 		await self._exec_cmd(cmd, param1, param2, timeout)
-		# Wait for feedback (return value / error):
-		await self._receive_message(self.feedback_timeout);
+		# Wait for feedback (return value / error), timeout type depends on whether cmd was ACKd:
+		await self._receive_message(self.feedback_timeout if self._buffer_send[4] else self.timeout)
 		bytes = self._buffer_read
 		res_cmd = bytes[3]
 		if res_cmd != cmd:
@@ -421,7 +438,7 @@ class DFPlayer:
 		await self.send_cmd(0x09, _DEVICE_FLAG_TO_SOURCE[self._last_selected_device])
 
 	async def reset(self):
-		await self.send_cmd(0x0c)
+		await self.send_cmd(0x0c) # TODO: Await the accompanying ready event?
 
 	async def source(self, device: int):
 		self._last_selected_device = device
