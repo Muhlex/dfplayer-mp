@@ -1,24 +1,24 @@
 try:
-	from collections.abc import Callable
+	from collections.abc import Callable, Awaitable
 except ImportError:
 	pass
 
 from micropython import const
-from machine import UART
+from machine import UART, Pin
 from binascii import hexlify
 
 try:
 	from asyncio import create_task, sleep_ms, Task, TimeoutError
-	from asyncio.funcs import wait_for_ms
+	from asyncio.funcs import wait_for_ms, gather
 	from asyncio.stream import Stream
 	from asyncio.lock import Lock
-	from asyncio.event import Event
+	from asyncio.event import Event, ThreadSafeFlag
 except ImportError:
 	from uasyncio import create_task, sleep_ms, Task, TimeoutError
-	from uasyncio.funcs import wait_for_ms
+	from uasyncio.funcs import wait_for_ms, gather
 	from uasyncio.stream import Stream
 	from uasyncio.lock import Lock
-	from uasyncio.event import Event
+	from uasyncio.event import Event, ThreadSafeFlag
 
 class DFPlayerError(Exception):
 	pass
@@ -120,7 +120,8 @@ class DFPlayer:
 
 	def __init__(
 		self, uart_id: int,
-		timeout = 200, feedback_timeout = 50,
+		busy_pin_id: int | None = None,
+		timeout = 200, feedback_timeout = 50, busy_timeout = 300,
 		retries = 5,
 		skip_ack: set[int] = {},
 		log_level = _LOG_NONE,
@@ -131,8 +132,15 @@ class DFPlayer:
 		self._lock = Lock()
 		self._read_task: Task | None = None
 
+		self._busy_pin = None
+		self._busy_flag = ThreadSafeFlag()
+		if busy_pin_id is not None:
+			self._busy_pin = Pin(busy_pin_id, Pin.IN)
+			if not self._busy_pin.value(): self._busy_flag.set() # busy pin is low when busy
+
 		self.timeout = timeout
 		self.feedback_timeout = feedback_timeout
+		self.busy_timeout = busy_timeout
 		self.retries = retries
 		self.skip_ack = skip_ack
 		self.log_level = log_level
@@ -188,6 +196,10 @@ class DFPlayer:
 			raise DFPlayerInitializationError("Cannot initialize DFPlayer instance after deinit")
 		self._uart.init(baudrate=9600, bits=8, parity=None, stop=1, **kwargs)
 		self._read_task = create_task(self._read_loop())
+		if self._busy_pin is not None:
+			def busy_isr(pin: Pin):
+				self._busy_flag.clear() if pin.value() else self._busy_flag.set()
+			self._busy_pin.irq(handler=busy_isr, trigger=Pin.IRQ_FALLING | Pin.IRQ_RISING)
 		self._init = _INIT_TRUE
 
 	def deinit(self):
@@ -196,6 +208,8 @@ class DFPlayer:
 		self._stream.close()
 		self._uart.deinit()
 		self._read_task.cancel()
+		if self._busy_pin is not None:
+			self._busy_pin.irq(handler=None)
 		self._init = _INIT_DEINIT
 
 	def _get_checksum(self, bytes: bytearray):
@@ -351,23 +365,50 @@ class DFPlayer:
 		return locked
 
 	@_require_lock
-	async def send_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
+	async def send_cmd(
+		self, cmd: int, param1 = 0, param2: int | None = None,
+		timeout: int | None = None, await_busy = False,
+	):
 		await self._exec_cmd(cmd, param1, param2, timeout)
-		# Wait for feedback (success / internal error), timeout type depends on whether cmd was ACKd:
-		try:
-			await self._receive_message(self.feedback_timeout if self._buffer_send[4] else self.timeout)
-		except DFPlayerInternalError as error:
-			raise error
-		except (DFPlayerTimeoutError, DFPlayerTransmissionError):
-			# Timeout => Success (DFPlayer sends nothing on success)
-			# TransmissionError => DFPlayer sent garbage data: Practice shows it's usually a success.
-			pass
+
+		# Wait for feedback (error / success -> error times out or busy pin activates):
+		used_ack = self._buffer_send[4] # also consider regular timeout when cmd wasn't ACKd
+		async def wait_feedback():
+			feedback_timeout = self.feedback_timeout
+			if not used_ack: feedback_timeout += self.timeout
+			try:
+				await self._receive_message(feedback_timeout)
+				raise DFPlayerUnexpectedMessageError("Error expected, instead received: " + hex(self._buffer_read[3]))
+			except (DFPlayerTimeoutError, DFPlayerTransmissionError):
+				# Timeout => Success (DFPlayer sends nothing on success)
+				# TransmissionError => DFPlayer sent garbage data: Practice shows it's usually a success.
+				pass
+		async def wait_busy():
+			busy_timeout = self.busy_timeout
+			if not used_ack: busy_timeout += self.timeout
+			try:
+				await wait_for_ms(self._busy_flag.wait(), busy_timeout)
+			except TimeoutError:
+				raise DFPlayerTimeoutError("DFPlayer did not go busy in time")
+		awaitables = [wait_feedback()]
+		if await_busy:
+			awaitables.append(wait_busy())
+
+		await gather(*awaitables, return_exceptions=False)
 
 	@_require_lock
-	async def send_query(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
+	async def send_query(
+		self, cmd: int, param1 = 0, param2: int | None = None,
+		timeout: int | None = None,
+	):
 		await self._exec_cmd(cmd, param1, param2, timeout)
-		# Wait for feedback (return value / error), timeout type depends on whether cmd was ACKd:
-		await self._receive_message(self.feedback_timeout if self._buffer_send[4] else self.timeout)
+
+		# Wait for feedback (error / return value):
+		feedback_timeout = self.feedback_timeout
+		if not self._buffer_send[4]: # also consider regular timeout when cmd wasn't ACKd
+			feedback_timeout += self.timeout
+
+		await self._receive_message(feedback_timeout)
 		bytes = self._buffer_read
 		res_cmd = bytes[3]
 		if res_cmd != cmd:
@@ -376,12 +417,12 @@ class DFPlayer:
 
 
 
-	async def play(self, folder: int, file: int):
+	async def play(self, folder: int, file: int, await_start = False):
 		if folder == DFPlayer.FOLDER_ADVERT:
 			self._events.advert_done.set()
 			await sleep_ms(0)
 			self._events.advert_done.clear()
-			await self.send_cmd(0x13, file)
+			await self.send_cmd(0x13, file, await_busy=await_start)
 			return
 
 		self._events.advert_done.set() # Playing regular tracks also cancels currently running adverts.
@@ -390,20 +431,20 @@ class DFPlayer:
 		self._events.track_done.clear()
 
 		if folder == DFPlayer.FOLDER_ROOT:
-			await self.send_cmd(0x03, file)
+			await self.send_cmd(0x03, file, await_busy=await_start)
 		elif folder == DFPlayer.FOLDER_MP3:
-			await self.send_cmd(0x12, file)
+			await self.send_cmd(0x12, file, await_busy=await_start)
 		else: # numbered folder
-			await self.send_cmd(0x0f, folder, file)
+			await self.send_cmd(0x0f, folder, file, await_busy=await_start)
 
-	async def play_root(self, file: int):
-		await self.play(DFPlayer.FOLDER_ROOT, file)
+	async def play_root(self, file: int, await_start = False):
+		await self.play(DFPlayer.FOLDER_ROOT, file, await_start)
 
-	async def play_mp3(self, file: int):
-		await self.play(DFPlayer.FOLDER_MP3, file)
+	async def play_mp3(self, file: int, await_start = False):
+		await self.play(DFPlayer.FOLDER_MP3, file, await_start)
 
-	async def play_advert(self, file: int):
-		await self.play(DFPlayer.FOLDER_ADVERT, file)
+	async def play_advert(self, file: int, await_start = False):
+		await self.play(DFPlayer.FOLDER_ADVERT, file, await_start)
 
 	async def resume(self):
 		await self.send_cmd(0x0D)
@@ -427,7 +468,8 @@ class DFPlayer:
 		return await self.send_query(0x42)
 
 	async def playing(self):
-		# TODO: Add busy pin support
+		if self._busy_pin is not None:
+			return not self._busy_pin.value()
 		return (await self.state()) == DFPlayer.STATE_PLAYING
 
 	async def volume(self, volume: int | None = None):
