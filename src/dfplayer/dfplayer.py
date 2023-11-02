@@ -91,15 +91,20 @@ _LOG_DEBUG = const(1)
 _LOG_ALL   = const(2)
 
 class DFPlayer:
-	FOLDER_ROOT   = const(-1)
-	FOLDER_MP3    = const(-2)
-	FOLDER_ADVERT = const(-3)
+	FOLDER_MP3    = const(-1)
+	FOLDER_ADVERT = const(-2)
 
 	STATE_STOPPED = const(0)
 	STATE_PLAYING = const(1)
 	STATE_PAUSED  = const(2)
 
-	EQ_NORMAL  = const(0)
+	MODE_REPEAT_ALL    = const(1)
+	MODE_REPEAT_FILE   = const(2)
+	MODE_REPEAT_FOLDER = const(3)
+	MODE_RANDOM_ALL    = const(4)
+	MODE_SINGLE        = const(5)
+
+	EQ_FLAT    = const(0)
 	EQ_POP     = const(1)
 	EQ_ROCK    = const(2)
 	EQ_JAZZ    = const(3)
@@ -164,6 +169,7 @@ class DFPlayer:
 		self._message_receive_done = Event()
 		self._message_receive_done.set()
 
+		self._last_mode = DFPlayer.MODE_SINGLE
 		self._last_selected_device = DFPlayer.DEVICE_SDCARD
 
 		class Events():
@@ -238,16 +244,17 @@ class DFPlayer:
 		bytes = self._buffer_read
 		bytes_partial = self._buffer_read_partial
 
-		read_length = await self._stream.readinto(bytes)
-		self._validate_read(read_length)
-		while read_length < len(bytes):
-			read_length_partial = await self._stream.readinto(bytes_partial)
-			for i in range(read_length_partial):
-				bytes[read_length + i] = bytes_partial[i]
-			read_length += read_length_partial
+		try:
+			read_length = await self._stream.readinto(bytes)
 			self._validate_read(read_length)
-
-		if self._log(_LOG_ALL): self._log.print("RX:", hexlify(bytes, " "))
+			while read_length < len(bytes):
+				read_length_partial = await self._stream.readinto(bytes_partial)
+				for i in range(read_length_partial):
+					bytes[read_length + i] = bytes_partial[i]
+				read_length += read_length_partial
+				self._validate_read(read_length)
+		finally:
+			if self._log(_LOG_ALL): self._log.print("RX:", hexlify(bytes[:read_length], " "))
 
 		if bytes[3] == 0x40: # error reported
 			code = bytes[6]
@@ -411,8 +418,8 @@ class DFPlayer:
 		await self._receive_message(feedback_timeout)
 		bytes = self._buffer_read
 		res_cmd = bytes[3]
-		if res_cmd != cmd:
-			raise DFPlayerUnexpectedMessageError("Query for " + hex(cmd) + " returned " + hex(res_cmd))
+		if (0xf0 & res_cmd) != 0x40:
+			raise DFPlayerUnexpectedMessageError("Query result expected, instead received: " + hex(res_cmd))
 		return self._bytes_to_uint16((bytes[5], bytes[6]))
 
 
@@ -430,15 +437,24 @@ class DFPlayer:
 		await sleep_ms(0)
 		self._events.track_done.clear()
 
-		if folder == DFPlayer.FOLDER_ROOT:
-			await self.send_cmd(0x03, file, await_busy=await_start)
+		if folder is None: # file is track id
+			if self._last_mode == DFPlayer.MODE_REPEAT_FILE:
+				await self.send_cmd(0x08, file, await_busy=await_start)
+			else:
+				await self.send_cmd(0x03, file, await_busy=await_start)
 		elif folder == DFPlayer.FOLDER_MP3:
 			await self.send_cmd(0x12, file, await_busy=await_start)
 		else: # numbered folder
-			await self.send_cmd(0x0f, folder, file, await_busy=await_start)
+			if file > 0xff:
+				if folder > 0xf:
+					raise ValueError("Cannot use folder " + str(folder) + " to playback file numbers > 255 (folder must be < 16)")
+				param = (folder << 12) | (file & 0xfff)
+				await self.send_cmd(0x14, param, await_busy=await_start)
+			else:
+				await self.send_cmd(0x0f, folder, file, await_busy=await_start)
 
-	async def play_root(self, file: int, await_start = False):
-		await self.play(DFPlayer.FOLDER_ROOT, file, await_start)
+	async def play_id(self, track_id: int, await_start = False):
+		await self.play(None, track_id, await_start)
 
 	async def play_mp3(self, file: int, await_start = False):
 		await self.play(DFPlayer.FOLDER_MP3, file, await_start)
@@ -447,7 +463,7 @@ class DFPlayer:
 		await self.play(DFPlayer.FOLDER_ADVERT, file, await_start)
 
 	async def resume(self):
-		await self.send_cmd(0x0D)
+		await self.send_cmd(0x0d)
 
 	async def pause(self):
 		await self.send_cmd(0x0e)
@@ -479,6 +495,9 @@ class DFPlayer:
 			await self.send_cmd(0x06, volume)
 			return volume
 
+	async def gain(self, gain: int):
+		await self.send_cmd(0x10, 1, gain)
+
 	async def eq(self, eq: int | None = None):
 		if eq is None:
 			return await self.send_query(0x44)
@@ -486,11 +505,36 @@ class DFPlayer:
 			await self.send_cmd(0x07, eq)
 			return eq
 
-	async def standby_enter(self):
-		await self.send_cmd(0x0a)
+	async def mode(self, mode: int | None = None, folder: int | None = None):
+		if mode is None:
+			mode = await self.send_query(0x45)
+			self._last_mode = mode
+			return mode
+		else:
+			if mode == DFPlayer.MODE_SINGLE:
+				await self.send_cmd(0x19, 1)
+			elif mode == DFPlayer.MODE_REPEAT_FILE:
+				await self.send_cmd(0x19, 0)
+			elif mode == DFPlayer.MODE_REPEAT_FOLDER:
+				if folder is None or folder < 0:
+					raise ValueError("Must specify numeric folder for folder-repeating playback mode")
+				await self.send_cmd(0x17, folder)
+			elif mode == DFPlayer.MODE_REPEAT_ALL:
+				await self.send_cmd(0x11, 1)
+			elif mode == DFPlayer.MODE_RANDOM_ALL:
+				await self.send_cmd(0x18)
+			self._last_mode = mode
+			return mode
 
-	async def standby_exit(self):
-		await self.send_cmd(0x0b)
+	async def source(self, device: int):
+		self._last_selected_device = device
+		await self.send_cmd(0x09, _DEVICE_FLAG_TO_SOURCE[device])
+
+	async def dac(self, enable: bool):
+		await self.send_cmd(0x1a, not enable)
+
+	async def standby(self, enable: bool):
+		await self.send_cmd(0x0a if enable else 0x0b)
 
 	async def sleep(self):
 		await self.send_cmd(0x09, _DEVICE_SOURCE_SLEEP)
@@ -501,15 +545,57 @@ class DFPlayer:
 	async def reset(self):
 		await self.send_cmd(0x0c) # TODO: Await the accompanying ready event?
 
-	async def source(self, device: int):
-		self._last_selected_device = device
-		await self.send_cmd(0x09, _DEVICE_FLAG_TO_SOURCE[device])
+	async def num_folders(self):
+		return await self.send_query(0x4f)
+
+	async def num_files_folder(self, folder: int):
+		if folder < 0:
+			raise ValueError("Only numeric folders can be queried for number of contained files")
+		return await self.send_query(0x4e, folder)
+
+	async def num_files_device(self, device: int | None = None):
+		if device is None:
+			device = self._last_selected_device
+
+		if device == DFPlayer.DEVICE_USB:
+			return await self.send_query(0x47)
+		elif device == DFPlayer.DEVICE_SDCARD:
+			return await self.send_query(0x48)
+		elif device == DFPlayer.DEVICE_FLASH:
+			return await self.send_query(0x49)
+
+		raise ValueError("Invalid device specified")
+
+	async def track_id(self, device: int | None = None):
+		if device is None:
+			device = self._last_selected_device
+
+		if device == DFPlayer.DEVICE_USB:
+			return await self.send_query(0x4B)
+		elif device == DFPlayer.DEVICE_SDCARD:
+			return await self.send_query(0x4C)
+		elif device == DFPlayer.DEVICE_FLASH:
+			return await self.send_query(0x4D)
+
+		raise ValueError("Invalid device specified")
+
+	async def version(self):
+		return await self.send_query(0x46)
 
 	async def wait_track_done(self):
 		await self._events.track_done.wait()
 
 	async def wait_advert_done(self):
 		await self._events.advert_done.wait()
+
+	def _on(self, event: int, handler: Callable):
+		self._events.handlers[event].append(handler)
+
+	def _off(self, event: int, handler: Callable | None):
+		if handler is None:
+			self._events.handlers[event].clear()
+		else:
+			self._events.handlers[event].remove(handler)
 
 	def on_done(self, handler: Callable[[int, int]]):
 		self._on(_EVENT_DONE, handler)
@@ -520,9 +606,6 @@ class DFPlayer:
 	def on_ready(self, handler: Callable[[int]]):
 		self._on(_EVENT_READY, handler)
 
-	def _on(self, event: int, handler: Callable):
-		self._events.handlers[event].append(handler)
-
 	def off_done(self, handler: Callable[[int, int]] | None = None):
 		self._off(_EVENT_DONE, handler)
 	def off_eject(self, handler: Callable[[int]] | None = None):
@@ -531,9 +614,3 @@ class DFPlayer:
 		self._off(_EVENT_INSERT, handler)
 	def off_ready(self, handler: Callable[[int]] | None = None):
 		self._off(_EVENT_READY, handler)
-
-	def _off(self, event: int, handler: Callable | None):
-		if handler is None:
-			self._events.handlers[event].clear()
-		else:
-			self._events.handlers[event].remove(handler)
