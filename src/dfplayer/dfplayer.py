@@ -1,5 +1,5 @@
 try:
-	from collections.abc import Callable, Awaitable
+	from collections.abc import Callable
 except ImportError:
 	pass
 
@@ -427,15 +427,13 @@ class DFPlayer:
 	async def play(self, folder: int, file: int, await_start = False):
 		if folder == DFPlayer.FOLDER_ADVERT:
 			self._events.advert_done.set()
-			await sleep_ms(0)
-			self._events.advert_done.clear()
+			self._events.advert_done = Event()
 			await self.send_cmd(0x13, file, await_busy=await_start)
-			return
+			return self._events.advert_done.wait()
 
 		self._events.advert_done.set() # Playing regular tracks also cancels currently running adverts.
 		self._events.track_done.set()
-		await sleep_ms(0)
-		self._events.track_done.clear()
+		self._events.track_done = Event()
 
 		if folder is None: # file is track id
 			if self._last_mode == DFPlayer.MODE_REPEAT_FILE:
@@ -453,14 +451,16 @@ class DFPlayer:
 			else:
 				await self.send_cmd(0x0f, folder, file, await_busy=await_start)
 
+		return self._events.track_done.wait()
+
 	async def play_id(self, track_id: int, await_start = False):
-		await self.play(None, track_id, await_start)
+		return await self.play(None, track_id, await_start)
 
 	async def play_mp3(self, file: int, await_start = False):
-		await self.play(DFPlayer.FOLDER_MP3, file, await_start)
+		return await self.play(DFPlayer.FOLDER_MP3, file, await_start)
 
 	async def play_advert(self, file: int, await_start = False):
-		await self.play(DFPlayer.FOLDER_ADVERT, file, await_start)
+		return await self.play(DFPlayer.FOLDER_ADVERT, file, await_start)
 
 	async def resume(self):
 		await self.send_cmd(0x0d)
@@ -581,12 +581,6 @@ class DFPlayer:
 
 	async def version(self):
 		return await self.send_query(0x46)
-
-	async def wait_track_done(self):
-		await self._events.track_done.wait()
-
-	async def wait_advert_done(self):
-		await self._events.advert_done.wait()
 
 	def _on(self, event: int, handler: Callable):
 		self._events.handlers[event].append(handler)
