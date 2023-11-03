@@ -126,7 +126,7 @@ class DFPlayer:
 	def __init__(
 		self, uart_id: int,
 		busy_pin_id: int | None = None,
-		timeout = 200, feedback_timeout = 50, busy_timeout = 300,
+		timeout = 200, timeout_feedback = 50, timeout_busy = 300,
 		retries = 5,
 		skip_ack: set[int] = {},
 		log_level = _LOG_NONE,
@@ -144,8 +144,8 @@ class DFPlayer:
 			if not self._busy_pin.value(): self._busy_flag.set() # busy pin is low when busy
 
 		self.timeout = timeout
-		self.feedback_timeout = feedback_timeout
-		self.busy_timeout = busy_timeout
+		self.timeout_feedback = timeout_feedback
+		self.timeout_busy = timeout_busy
 		self.retries = retries
 		self.skip_ack = skip_ack
 		self.log_level = log_level
@@ -172,17 +172,38 @@ class DFPlayer:
 		self._last_selected_device = DFPlayer.DEVICE_SDCARD
 
 		class Events():
-			def __init__(self):
-				self.handlers = {
+			def __init__(this):
+				this.handlers = {
 					_EVENT_INSERT: [],
 					_EVENT_EJECT: [],
 					_EVENT_DONE: [],
 					_EVENT_READY: [],
 				}
-				self.track_done = Event()
-				self.track_done.set()
-				self.advert_done = Event()
-				self.advert_done.set()
+				this.track_done = Event()
+				this.track_done.set()
+				this.advert_done = Event()
+				this.advert_done.set()
+
+				class Available(): # Wrap Event API to ensure DFPlayer availability will be fetched once.
+					def __init__(this):
+						this._fetched = False
+						this._event = Event()
+					def _ensure_fetch(this):
+						if not this._fetched:
+							this._fetched = True
+							create_task(self._fetch_available())
+					def set(this):
+						this._fetched = True
+						this._event.set()
+					def clear(this):
+						this._event.clear()
+					def is_set(this):
+						this._ensure_fetch()
+						return this._event.is_set()
+					def wait(this):
+						this._ensure_fetch()
+						return this._event.wait()
+				this.available = Available()
 		self._events = Events()
 
 		class Log():
@@ -253,6 +274,8 @@ class DFPlayer:
 		finally:
 			if self._log(_LOG_ALL): self._log.print("RX:", hexlify(bytes[:read_length], " "))
 
+		self._events.available.set()
+
 		if bytes[3] == 0x40: # error reported
 			code = bytes[6]
 			message = _ERROR_CODE_TO_MESSAGE[code] if code in _ERROR_CODE_TO_MESSAGE else "Unknown error"
@@ -315,14 +338,16 @@ class DFPlayer:
 		for handler in self._events.handlers[event]:
 			handler(*args)
 
-	async def _exec_cmd(self, cmd: int, param1 = 0, param2: int | None = None, timeout: int | None = None):
+	async def _exec_cmd(
+		self, cmd: int, param1 = 0, param2: int | None = None,
+		timeout: int | None = None, use_ack = False
+	):
 		if self._init != _INIT_TRUE:
 			raise DFPlayerInitializationError("DFPlayer instance must be initialized to execute commands")
 		if param2 is None:
 			param1, param2 = self._uint16_to_bytes(param1)
 		if timeout is None:
 			timeout = self.timeout
-		use_ack = cmd not in self.skip_ack
 
 		bytes = self._buffer_send
 		bytes[3] = cmd
@@ -369,29 +394,38 @@ class DFPlayer:
 		return locked
 
 	@_require_lock
+	async def _fetch_available(self):
+		await self._exec_cmd(0x43, use_ack=False)
+		try:
+			# Successful read of any message will set the available event:
+			await self._receive_message(self.timeout)
+		except:
+			pass
+
+	@_require_lock
 	async def send_cmd(
 		self, cmd: int, param1 = 0, param2: int | None = None,
 		timeout: int | None = None, await_busy = False,
 	):
-		await self._exec_cmd(cmd, param1, param2, timeout)
+		use_ack = cmd not in self.skip_ack
+		await self._exec_cmd(cmd, param1, param2, timeout, use_ack)
 
 		# Wait for feedback (error / success -> error times out or busy pin activates):
-		used_ack = self._buffer_send[4] # also consider regular timeout when cmd wasn't ACKd
 		async def wait_feedback():
-			feedback_timeout = self.feedback_timeout
-			if not used_ack: feedback_timeout += self.timeout
+			timeout_feedback = self.timeout_feedback
+			if not use_ack: timeout_feedback += self.timeout
 			try:
-				await self._receive_message(feedback_timeout)
+				await self._receive_message(timeout_feedback)
 				raise DFPlayerUnexpectedMessageError("Error expected, instead received: " + hex(self._buffer_read[3]))
 			except (DFPlayerTimeoutError, DFPlayerTransmissionError):
 				# Timeout => Success (DFPlayer sends nothing on success)
 				# TransmissionError => DFPlayer sent garbage data: Practice shows it's usually a success.
 				pass
 		async def wait_busy():
-			busy_timeout = self.busy_timeout
-			if not used_ack: busy_timeout += self.timeout
+			timeout_busy = self.timeout_busy
+			if not use_ack: timeout_busy += self.timeout
 			try:
-				await wait_for_ms(self._busy_flag.wait(), busy_timeout)
+				await wait_for_ms(self._busy_flag.wait(), timeout_busy)
 			except TimeoutError:
 				raise DFPlayerTimeoutError("DFPlayer did not go busy in time")
 		awaitables = [wait_feedback()]
@@ -405,14 +439,14 @@ class DFPlayer:
 		self, cmd: int, param1 = 0, param2: int | None = None,
 		timeout: int | None = None,
 	):
-		await self._exec_cmd(cmd, param1, param2, timeout)
+		use_ack = cmd not in self.skip_ack
+		await self._exec_cmd(cmd, param1, param2, timeout, use_ack)
 
 		# Wait for feedback (error / return value):
-		feedback_timeout = self.feedback_timeout
-		if not self._buffer_send[4]: # also consider regular timeout when cmd wasn't ACKd
-			feedback_timeout += self.timeout
+		timeout_feedback = self.timeout_feedback
+		if not use_ack: timeout_feedback += self.timeout
 
-		await self._receive_message(feedback_timeout)
+		await self._receive_message(timeout_feedback)
 		bytes = self._buffer_read
 		res_cmd = bytes[3]
 		if (0xf0 & res_cmd) != 0x40:
@@ -540,7 +574,14 @@ class DFPlayer:
 		await self.send_cmd(0x09, _DEVICE_FLAG_TO_SOURCE[self._last_selected_device])
 
 	async def reset(self):
-		await self.send_cmd(0x0c) # TODO: Await the accompanying ready event?
+		await self.send_cmd(0x0c)
+		self._events.available.clear()
+
+	def available(self) -> bool:
+		return self._events.available.is_set()
+
+	async def wait_available(self):
+		await self._events.available.wait()
 
 	async def num_folders(self):
 		return await self.send_query(0x4f)
