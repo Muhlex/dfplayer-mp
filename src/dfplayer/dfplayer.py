@@ -163,7 +163,6 @@ class DFPlayer:
 			_END_BIT,
 		])
 		self._buffer_read = bytearray(10)
-		self._buffer_read_partial = bytearray(10)
 		self._error: DFPlayerError | None = None
 		self._message_receive_ready = Event()
 		self._message_receive_done = Event()
@@ -242,16 +241,14 @@ class DFPlayer:
 
 	async def _read(self):
 		bytes = self._buffer_read
-		bytes_partial = self._buffer_read_partial
 
 		try:
 			read_length = await self._stream.readinto(bytes)
 			self._validate_read(read_length)
 			while read_length < len(bytes):
-				read_length_partial = await self._stream.readinto(bytes_partial)
-				for i in range(read_length_partial):
-					bytes[read_length + i] = bytes_partial[i]
-				read_length += read_length_partial
+				bytes_partial = await self._stream.read(len(bytes) - read_length)
+				bytes[read_length:read_length + len(bytes_partial)] = bytes_partial
+				read_length += len(bytes_partial)
 				self._validate_read(read_length)
 		finally:
 			if self._log(_LOG_ALL): self._log.print("RX:", hexlify(bytes[:read_length], " "))
