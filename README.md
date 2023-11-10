@@ -1,6 +1,6 @@
-# DFPlayer Driver for MicroPython
+# DFPlayer Mini Driver for MicroPython
 
-This is a fully featured driver for the DFPlayer MP3 player by DFRobot.
+This is a fully featured driver for the DFPlayer Mini MP3 player by DFRobot.
 It also supports other manufacturer's versions of the module.
 
 ⚠️️ The API is meant to be used in conjunction with the `asyncio` library.
@@ -10,6 +10,7 @@ the player acknowledged the command/returned a queried value.
 🌐 **[DFRobot Wiki](https://wiki.dfrobot.com/DFPlayer_Mini_SKU_DFR0299)** (for Pinout & Connection)
 
 ## Examples
+
 ### Basic Usage
 
 ```python
@@ -17,14 +18,14 @@ from asyncio import run
 from dfplayer import DFPlayer
 
 async def main():
-	df = DFPlayer(0)
-	df.init()
-	await df.wait_available() # Optional, make sure DFPlayer is booted.
+    df = DFPlayer(0)
+    df.init()
+    await df.wait_available() # Optional, make sure DFPlayer is booted.
 
-	await df.volume(15)
-	print("DFPlayer reports volume:", await df.volume())
+    await df.volume(15)
+    print("DFPlayer reports volume:", await df.volume())
 
-	await df.play(4, 28)
+    await df.play(4, 28)
 
 run(main())
 ```
@@ -33,7 +34,7 @@ run(main())
 ```python
 df = DFPlayer(0)
 def handle_done(device: int, track_id: int):
-	print("Playback ended on storage device: {} (Track ID: {})".format(device, track_id))
+    print("Playback ended on storage device: {} (Track ID: {})".format(device, track_id))
 df.on_done(handle_done)
 df.on_eject(lambda device: print("Device", device, "ejected!"))
 df.on_insert(lambda device: print("Device", device, "inserted!"))
