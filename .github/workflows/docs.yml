@@ -29,13 +29,14 @@ jobs:
         with:
           # Semantic version range syntax or exact version of a Python version
           python-version: '3.11'
-      # You can test your matrix by printing the current Python version
-      - name: Display Python version
-        run: python -c "import sys; print(sys.version)"
       - name: Install dependencies
         run: python -m pip install .[docs]
       - name: Run pydoctor
-        run: pydoctor --project-base-dir="${{ steps.pages.outputs.base_path }}"
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          pydoctor \
+            --project-version=$VERSION \
+            --html-viewsource-base=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_REF_NAME
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v1
         with:

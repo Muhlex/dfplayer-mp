@@ -19,9 +19,7 @@ docs = [
 [tool.pydoctor]
 add-package = ["src/dfplayer/dfplayer.py"]
 project-name = "dfplayer-mp"
-project-version= "1.0.1"
 project-url = "https://github.com/Muhlex/dfplayer-mp"
-html-viewsource-base = "https://github.com/Muhlex/dfplayer-mp/tree/v1.0.1"
 html-output = "./build/docs"
 project-base-dir = "."
 docformat = "google"
