@@ -7,7 +7,12 @@ It also supports other manufacturer's versions of the module.
 All methods that interface with the DFPlayer must be awaited until
 the player acknowledged the command/returned a queried value.
 
-🌐 **[DFRobot Wiki](https://wiki.dfrobot.com/DFPlayer_Mini_SKU_DFR0299)** (for Pinout & Connection)
+
+## Resources
+
+📖 [**API Documentation**](https://muhlex.github.io/dfplayer-mp/)<br>
+🌐 [**DFRobot Wiki**](https://wiki.dfrobot.com/DFPlayer_Mini_SKU_DFR0299) (for Pinout & Connection)
+
 
 ## Examples
 
