@@ -1,4 +1,4 @@
-# DFPlayer Mini Driver for MicroPython
+# Async DFPlayer Mini Driver for MicroPython
 
 This is a fully featured driver for the DFPlayer Mini MP3 player by DFRobot.
 It also supports other manufacturer's versions of the module.

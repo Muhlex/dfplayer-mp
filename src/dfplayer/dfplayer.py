@@ -1,3 +1,10 @@
+"""
+**Async DFPlayer Mini Driver for MicroPython**
+
+This is a fully featured driver for the DFPlayer Mini MP3 player by DFRobot.
+It also supports other manufacturer's versions of the module.
+"""
+
 try:
 	from collections.abc import Callable
 except ImportError:
@@ -21,20 +28,27 @@ except ImportError:
 	from uasyncio.event import Event, ThreadSafeFlag
 
 class DFPlayerError(Exception):
+	""" Base Class of any module-specific Error. """
 	pass
 class DFPlayerInitializationError(DFPlayerError):
+	""" Raised if DFPlayer instance is used uninitialized or when invalidly calling ``init`` or ``deinit``. """
 	pass
 class DFPlayerTimeoutError(DFPlayerError):
+	""" Raised when DFPlayer communication times out. """
 	pass
 class DFPlayerTransmissionError(DFPlayerError):
+	""" Raised when DFPlayer sends a malformed message. """
 	pass
 class DFPlayerInternalError(DFPlayerError):
-	def __init__(self, code, *args):
+	""" Raised when DFPlayer reports an error. """
+	def __init__(self, code: int, *args):
 		super().__init__(*args)
-		self.code = code
+		self.code: int = code
+		""" Error code. """
 	def __str__(self):
 		return "{} ({})".format(self.value, hex(self.code))
 class DFPlayerUnexpectedMessageError(DFPlayerError):
+	""" Raised when DFPlayer responds with a message not fitting a sent command or query. """
 	pass
 
 _START_BIT = const(0x7e)
@@ -143,42 +157,64 @@ _LOG_ALL   = const(2)
 
 class DFPlayer:
 	"""
-	Driver for the DFPlayer module by DFRobot. Compatible with other DFPlayer versions.
+	Controller for the DFPlayer module.
 
-	⚠️ All async methods may raise `DFPlayerError`s on communication failure
-	or internal errors reported by the module.
+	⚠️ All async methods may raise a ``DFPlayerError`` on communication failure
+	or on internal errors reported by the module.
 	"""
 	FOLDER_MP3    = const(-1)
+	""" 'MP3' folder on the storage device. """
 	FOLDER_ADVERT = const(-2)
+	""" 'ADVERT' folder on the storage device. """
 
 	STATE_STOPPED = const(0)
+	""" Playback halted, no track progress retained. """
 	STATE_PLAYING = const(1)
+	""" Playback in progress. """
 	STATE_PAUSED  = const(2)
+	""" Playback halted, track can be resumed. """
 
 	MODE_REPEAT_ALL    = const(1)
+	""" Repeat all tracks sequentially (includes adverts). """
 	MODE_REPEAT_FILE   = const(2)
+	""" Repeat a single file. """
 	MODE_REPEAT_FOLDER = const(3)
+	""" Repeat all tracks of a numeric folder. """
 	MODE_RANDOM_ALL    = const(4)
+	""" Randomize through all tracks (includes adverts). """
 	MODE_SINGLE        = const(5)
+	""" Play files once (default). """
 
 	EQ_FLAT    = const(0)
+	""" Flat (default/balanced) equalizer mode. """
 	EQ_POP     = const(1)
+	""" Pop equalizer mode. """
 	EQ_ROCK    = const(2)
+	""" Rock equalizer mode. """
 	EQ_JAZZ    = const(3)
+	""" Jazz equalizer mode. """
 	EQ_CLASSIC = const(4)
+	""" Classic equalizer mode. """
 	EQ_BASS    = const(5)
+	""" Bass-heavy equalizer mode. """
 
 	# Depending on the use-case, DFPlayer identifies devices differently.
 	# Use the bitwise flags for user interfacing, because these are both
 	# A) unique (so they can be mapped onto e. g. a playback source) and
 	# B) only these can be used to identify devices in the `ready` event.
 	DEVICE_USB    = _DEVICE_FLAG_USB
+	""" USB storage device. """
 	DEVICE_SDCARD = _DEVICE_FLAG_SDCARD
+	""" SD-CARD storage device. """
 	DEVICE_FLASH  = _DEVICE_FLAG_FLASH
+	""" Flash memory storage device. """
 
 	LOG_NONE  = _LOG_NONE
+	""" No log prints. """
 	LOG_DEBUG = _LOG_DEBUG
+	""" Print command send/receive logs — useful for debugging DFPlayer connection. """
 	LOG_ALL   = _LOG_ALL
+	""" Print all logs — useful for debugging the library. """
 
 	def __init__(
 		self,
@@ -215,12 +251,18 @@ class DFPlayer:
 			self._busy_pin = Pin(busy_pin_id, Pin.IN)
 			if not self._busy_pin.value(): self._busy_flag.set() # busy pin is low when busy
 
-		self.timeout = timeout
-		self.timeout_feedback = timeout_feedback
-		self.timeout_busy = timeout_busy
-		self.retries = retries
-		self.skip_ack = skip_ack
-		self.log_level = log_level
+		self.timeout: int = timeout
+		""" Milliseconds allowed for the player to process and acknowledge (ACK) sent commands. """
+		self.timeout_feedback: int = timeout_feedback
+		""" Milliseconds allowed between command ACK and feedback (error/query value). """
+		self.timeout_busy: int = timeout_busy
+		""" Milliseconds allowed between command ACK and busy pin activating (relevant commands only). """
+		self.retries: int = retries
+		""" How often to re-send a command on communication failure. """
+		self.skip_ack: set[int] = skip_ack
+		""" Set of command bytes (see source) to not require/request command ACK for. """
+		self.log_level: int = log_level
+		""" Print additional communication information (expects ``DFPlayer.LOG_``... constant). """
 
 		self._buffer_send = bytearray([
 			_START_BIT,
@@ -644,7 +686,7 @@ class DFPlayer:
 		await self.send_cmd(_CMD_RESUME)
 
 	async def pause(self):
-		""" Pause playback (can be resumed via ``resume()``). """
+		""" Pause playback (can be resumed via ``resume``). """
 		await self.send_cmd(_CMD_PAUSE)
 
 	async def stop(self):
@@ -717,7 +759,7 @@ class DFPlayer:
 		Query or set an equalizer preset.
 
 		Args:
-			eq: Set equalizer to one of ``DFPlayer.EQ_``... constants.
+			eq: Set equalizer to one of the ``DFPlayer.EQ_``... constants.
 		"""
 		if eq is None:
 			return await self.send_query(_QUERY_EQ)
@@ -735,7 +777,7 @@ class DFPlayer:
 		⚠️ ``DFPlayer.MODE_REPEAT_ALL`` and ``DFPlayer.MODE_RANDOM_ALL`` will also consider adverts.
 
 		Args:
-			mode: Set mode to one of ``DFPlayer.MODE_``... constants.
+			mode: Set mode to one of the ``DFPlayer.MODE_``... constants.
 			folder: Folder to repeat (only with ``DFPlayer.MODE_REPEAT_FOLDER``).
 		"""
 		if mode is None:
@@ -763,7 +805,7 @@ class DFPlayer:
 		Set the playback source device.
 
 		Args:
-			mode: Set mode to one of ``DFPlayer.DEVICE_``... constants.
+			device: Set device to one of the ``DFPlayer.DEVICE_``... constants.
 		"""
 		self._last_selected_device = device
 		await self.send_cmd(_CMD_SOURCE, _DEVICE_FLAG_TO_SOURCE[device])
@@ -799,7 +841,7 @@ class DFPlayer:
 		"""
 		Resets (reboots) the player.
 
-		The reboot can take up to 3 seconds and can be awaited using ``wait_available()``
+		The reboot can take up to 3 seconds and can be awaited using ``wait_available``
 
 		Example::
 
@@ -820,7 +862,7 @@ class DFPlayer:
 
 	def wait_available(self):
 		"""
-		Await DFPlayer availability (see ``available()``)
+		Await DFPlayer availability (see ``available``)
 
 		Can be used at program start to ensure the player is booted up before taking commands.
 
