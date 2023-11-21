@@ -1,0 +1,26 @@
+[project]
+name = "dfplayer-mp"
+description = "Async MicroPython driver for the DFPlayer Mini module by DFRobot"
+version = "1.0.1"
+license = { file = "LICENSE" }
+authors = [{ name = "Felix Bastian" }]
+readme = "README.md"
+keywords = ["dfplayer-mini", "micropython", "asyncio"]
+
+[project.urls]
+Homepage = "https://github.com/Muhlex/dfplayer-mp"
+"Bug Tracker" = "https://github.com/Muhlex/dfplayer-mp/issues"
+
+[project.optional-dependencies]
+docs = [
+	"pydoctor>=23.4.0",
+]
+
+[tool.pydoctor]
+add-package = ["src/dfplayer/dfplayer.py"]
+project-name = "dfplayer-mp"
+project-url = "https://github.com/Muhlex/dfplayer-mp"
+html-output = "./build/docs"
+project-base-dir = "."
+docformat = "google"
+theme = "readthedocs"
