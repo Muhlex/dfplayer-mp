@@ -8,7 +8,7 @@ the player acknowledged the command/returned a queried value.
 
 
 ## Resources ##
-📖 [**Documentation**](https://muhlex.github.io/dfplayer-mp/)<br>
+📖 [**API Reference**](https://muhlex.github.io/dfplayer-mp/)<br>
 🌐 [**DFRobot Wiki**](https://wiki.dfrobot.com/DFPlayer_Mini_SKU_DFR0299) (original arduino library)
 
 ## Required Hardware ##
@@ -30,11 +30,11 @@ Also, RX and TX need to be swapped for this to work (RX connected to TX and vise
 The used micro SD card needs to be either 16 or 32 GB and formatted in *FAT32*.
 The audio files can be either *mp3* or *WAV* and need to be stored using this file structure:
 - 01
-	- 000.mp3
+	- 001.mp3
 	- …
 	- 999.mp3
 - 02
-	- 000.WAV
+	- 001.WAV
 	- …
 	- 999.WAV
 
