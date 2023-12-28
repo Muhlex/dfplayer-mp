@@ -606,7 +606,7 @@ class DFPlayer:
 
 		Args:
 			folder: Folder of the track to be played (either numeric 1-99 or ``DFPlayer.FOLDER_``... constant).
-			file: Numeric file prefix (1-3000 in folders 1-15; 1-256 in folders 16-99; 0-9999 in MP3; 0-9999 in ADVERT)
+			file: Numeric file prefix (1-3000 in folders 1-15; 1-255 in folders 16-99; 0-9999 in MP3; 0-9999 in ADVERT)
 			await_start: If set, this coroutine only returns once the player starts playback (is busy).
 				``busy_pin_id`` must have been passed to constructor.
 
